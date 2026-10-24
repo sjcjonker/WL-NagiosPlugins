@@ -619,6 +619,9 @@ my @o_crit_max=         undef;  # critical levels of perfcheck
 my $o_checkperf=	undef;	# checks in/out/err/disc values
 my $o_delta=		300;	# delta of time of perfcheck (default 5min)
 my $o_ext_checkperf=	undef;  # extended perf checks (+error+discard)
+my $o_autocounters;              # Prefer a complete Counter64 pair, otherwise Counter32
+my @counter_bits;
+my @oid_auto;
 my $o_highperf=         undef;  # Use 64 bits counters
 my $o_meg=              undef;  # output in MBytes or Mbits (-M)
 my $o_gig=              undef;  # output in GBytes or Gbits (-G)
@@ -860,6 +863,10 @@ sub help {
    the port and plugin will return CRITICAL error if its anything else.
 --label
    Add label before speed in output : in=, out=, errors-out=, etc...
+--autocounters
+   Select counters per interface: prefer a complete 64-bit in/out pair, else
+   use a complete 32-bit pair. Requires SNMPv2c/v3. Overrides -g.
+   A counter-width change rebuilds the rate baseline. Neither pair => UNKNOWN.
 -g, --64bits
    Use 64 bits counters instead of the standard counters when checking
    bandwidth & performance data for interface >= 1Gbps.
@@ -1015,6 +1022,7 @@ sub check_options {
 	'z'	=> \$o_zerothresholds,	'zerothresholds' => \$o_zerothresholds,
         'B'     => \$o_kbits,           'kbits'         => \$o_kbits,
         's:i'   => \$o_short,      	'short:i'   	=> \$o_short,
+        'autocounters' => \$o_autocounters,
         'g'   	=> \$o_highperf,      	'64bits'   	=> \$o_highperf,
         'S:s'   => \$o_perfs,      	'intspeed:s'   	=> \$o_perfs,
         'y'   	=> \$o_perfp,      	'perfprct'   	=> \$o_perfp,
@@ -1059,9 +1067,9 @@ sub check_options {
 	{ print "Timeout must be >1 and <60 !\n"; print_usage(); exit $ERRORS{"UNKNOWN"}}
     if (!defined($o_timeout)) {$o_timeout=5;}
     # Check snmpv2c or v3 with 64 bit counters
-    if ( defined ($o_highperf) && (!defined($o_version2) && defined($o_community)))
+    if ( (defined($o_highperf) || defined($o_autocounters)) && (!defined($o_version2) && defined($o_community)))
       { print "Can't get 64 bit counters with snmp version 1\n"; print_usage(); exit $ERRORS{"UNKNOWN"}}
-    if (defined ($o_highperf)) {
+    if (defined($o_highperf) || defined($o_autocounters)) {
       if (eval "require bigint") {
         use bigint;
       } else  { print "Need bigint module for 64 bit counters\n"; print_usage(); exit $ERRORS{"UNKNOWN"}}
@@ -1485,6 +1493,11 @@ for (my $i=0;$i<$num_int;$i++) {
      if (defined($o_perf) || defined($o_checkperf)) {
        $oid_perf_inoct[$i]= $in_octet_table . $tindex[$i];
        $oid_perf_outoct[$i]= $out_octet_table . $tindex[$i];
+       if (defined($o_autocounters)) {
+           push @oid_auto, map { $_ . $tindex[$i] }
+               ('1.3.6.1.2.1.2.2.1.10.', '1.3.6.1.2.1.2.2.1.16.',
+                $in_octet_table_64, $out_octet_table_64);
+       }
        if (defined($o_ext_checkperf) || defined($o_perfe)) {
 	 $oid_perf_indisc[$i]= $in_discard_table . $tindex[$i];
 	 $oid_perf_outdisc[$i]= $out_discard_table . $tindex[$i];
@@ -1512,12 +1525,16 @@ if ( $num_int == 0 ) { print "ERROR : Unknown interface $o_descr\n" ; exit $ERRO
 # WL: do it as one query when -m option is used
 if (defined($o_perf) || defined($o_checkperf) || $expected_speed!=0) {
   @oid_perf=(@oid_perf_outoct,@oid_perf_inoct,@oid_speed);
-  if (defined($o_highperf)) {
+  if (defined($o_highperf) || defined($o_autocounters)) {
     @oid_perf=(@oid_perf,@oid_speed_high);
   }
   if (defined ($o_ext_checkperf) || defined($o_perfe)) {
     @oid_perf=(@oid_perf,@oid_perf_inerr,@oid_perf_outerr,@oid_perf_indisc,@oid_perf_outdisc);
   }
+}
+if (defined($o_autocounters)) {
+    my %seen;
+    @oid_perf = grep { defined($_) && !$seen{$_}++ } (@oid_perf, @oid_auto);
 }
 if (defined($o_ciscocat)) {
 	@oid_ciscostatus=(@oid_ciscofaultstatus,@oid_ciscooperstatus,@oid_ciscoaddoperstatus);
@@ -1557,6 +1574,24 @@ if (defined($o_perf) || defined($o_checkperf) || $expected_speed!=0) {
         $resultf = $result;
    }
 }
+# Probe both widths in the same statistics request. SNMPv2 exceptions describe
+# unsupported OIDs; a timeout is still a failed request, not a fallback signal.
+if (defined($o_autocounters) && defined($resultf)) {
+    for my $i (0 .. $num_int-1) {
+        $counter_bits[$i] = 0;
+        for my $bits (64, 32) {
+            my $in = ($bits == 64 ? $in_octet_table_64 : '1.3.6.1.2.1.2.2.1.10.') . $tindex[$i];
+            my $out = ($bits == 64 ? $out_octet_table_64 : '1.3.6.1.2.1.2.2.1.16.') . $tindex[$i];
+            if (defined($resultf->{$in}) && $resultf->{$in} =~ /\A\d+\z/
+                && defined($resultf->{$out}) && $resultf->{$out} =~ /\A\d+\z/) {
+                ($oid_perf_inoct[$i], $oid_perf_outoct[$i]) = ($in, $out);
+                $counter_bits[$i] = $bits;
+                last;
+            }
+        }
+    }
+}
+
 # Additional cisco status tables
 if (defined($o_ciscocat)) {
    if (!defined($o_minsnmp) && scalar(@oid_ciscostatus)>0) {
@@ -1652,6 +1687,10 @@ for (my $i=0;$i < $num_int; $i++) {
   }
   my $int_status_opt = 0;
   my $int_status_extratext = "";
+  my $bits = defined($o_autocounters) ? ($counter_bits[$i] || 0) : (defined($o_highperf) ? 64 : 32);
+  $int_status_extratext = $bits ? "counters=$bits-bit" : 'counters=unavailable' if defined($o_autocounters);
+  $final_status=3 if defined($o_autocounters) && !$bits
+      && (defined($o_perf) || defined($o_checkperf)) && $final_status==0;
 
   # WL: First verify description is correct when -m option (but not --mm) is used
   if (defined($o_minsnmp) && !defined($o_maxminsnmp)) {
@@ -1694,6 +1733,8 @@ for (my $i=0;$i < $num_int; $i++) {
                 $int_desc.='('.$$resulto{$o_commentoid.$tindex[$i]}.')' if $$resulto{$o_commentoid.$tindex[$i]};
         }
   }
+
+  $perf_out .= " ".perf_name($descr[$i], 'counter_bits')."=".$bits if defined($o_autocounters) && $bits;
 
   # WL: Additional cisco status data
   if (defined($o_ciscocat) && $cport[$i]) {
@@ -1803,7 +1844,7 @@ for (my $i=0;$i < $num_int; $i++) {
   # Get the speed in normal or highperf speed counters
   if (defined($oid_speed[$i]) && defined($$resultf{$oid_speed[$i]})) {
       if ($$resultf{$oid_speed[$i]} == 4294967295) { # Too high for this counter (cf IF-MIB)
-          if (! defined($o_highperf) && (defined($o_prct) || defined ($o_perfs) || defined ($o_perfp))) {
+          if (!defined($o_highperf) && !defined($o_autocounters) && (defined($o_prct) || defined ($o_perfs) || defined ($o_perfp))) {
               print "Cannot get interface speed with standard MIB, use highperf mib (-g) : UNKNOWN\n";
               exit $ERRORS{"UNKNOWN"}
           }
@@ -1838,7 +1879,7 @@ for (my $i=0;$i < $num_int; $i++) {
 	  $temp_file_name = $o_base_dir . $o_host ."." . $temp_file_name;
         }
         # First, read entire file
-        my @ret_array=read_file($temp_file_name,$n_items_check);
+        my @ret_array=read_file($temp_file_name,$n_items_check + (defined($o_autocounters) ? 1 : 0));
         $usable_data = shift(@ret_array);
         $n_rows = shift(@ret_array);
         @prev_values = @ret_array;
@@ -1884,6 +1925,12 @@ for (my $i=0;$i < $num_int; $i++) {
 	if ($jj==0) { $usable_data=1 } #NAK
 	  else { $usable_data=0; } # OK
     }
+    if (defined($o_autocounters) && defined($o_prevperf) && !defined($o_filestore)) {
+        my $previous_bits = $prev_perf{perf_name($descr[$i], 'counter_bits')};
+        for my $row (@prev_values[0 .. $n_rows-1]) {
+            $row->[$n_items_check] = defined($previous_bits) ? $previous_bits : 0;
+        }
+    }
     verb("Previous data array created: $n_rows rows");
     # Keep only the contiguous valid history after the most recent reset.
     # This also repairs existing history files without manual deletion.
@@ -1893,14 +1940,16 @@ for (my $i=0;$i < $num_int; $i++) {
         push @current, map { $$resultf{$_} }
             ($oid_perf_inerr[$i], $oid_perf_outerr[$i], $oid_perf_indisc[$i], $oid_perf_outdisc[$i]);
     }
+    push @current, $bits if defined($o_autocounters);
     my @clean;
     for my $row (@prev_values[0 .. $n_rows-1], \@current) {
-        unless (valid_rate_sample($row, $n_items_check) && $row->[0] <= $timenow) {
+        unless (valid_rate_sample($row, $n_items_check) && $row->[0] <= $timenow
+            && (!defined($o_autocounters) || ($bits && defined($row->[$n_items_check]) && $row->[$n_items_check] == $bits))) {
             @clean = ();
             $rate_reason = 'missing or invalid counters';
             next;
         }
-        if (@clean && !valid_rate_pair($clean[-1], $row, defined($o_highperf), $portspeed[$i], $n_items_check)) {
+        if (@clean && !valid_rate_pair($clean[-1], $row, $bits == 64, $portspeed[$i], $n_items_check)) {
             @clean = ();
             $rate_reason = 'counter discontinuity or implausible rate; rebuilding baseline';
         }
@@ -1958,7 +2007,7 @@ for (my $i=0;$i < $num_int; $i++) {
 	    }
 	    # check if the counter is back to 0 after 2^32 / 2^64.
 	    # First set the modulus depending on highperf counters or not
-	    my $overfl_mod = defined ($o_highperf) ? 18446744073709551616 : 4294967296;
+	    my $overfl_mod = $bits == 64 ? 18446744073709551616 : 4294967296;
 
 	    if (($checkval_tdiff=$prev_values[$j+1][0]-$prev_values[$j][0])!=0) {
               # check_perf_out_raw is array used to store calculations from multiple counts
@@ -2009,7 +2058,7 @@ for (my $i=0;$i < $num_int; $i++) {
     }
     # WL: modified to not write the file if both -P and -T options are used
     if (defined($temp_file_name) && ($o_filestore || !$o_prevperf || !$o_prevtime)) {
-      if (($_=write_file($temp_file_name,$n_rows,$n_items_check,@prev_values))!=0) {
+      if (($_=write_file($temp_file_name,$n_rows,$n_items_check + (defined($o_autocounters) ? 1 : 0),@prev_values))!=0) {
         $final_status=3;
         $print_out.= " !!Unable to write file ".$temp_file_name." !! ";
         verb ("Write file returned : $_");
@@ -2117,8 +2166,8 @@ for (my $i=0;$i < $num_int; $i++) {
     }
     # output in octet counter
     if (defined($o_perfo) || defined($o_prevperf)) {
-        $perf_out .= " ".perf_name($descr[$i],"in_octet")."=". $$resultf{$oid_perf_inoct[$i]} ."c" if defined($oid_perf_inoct[$i]) && defined($$resultf{$oid_perf_inoct[$i]});
-        $perf_out .= " ".perf_name($descr[$i],"out_octet")."=". $$resultf{$oid_perf_outoct[$i]} ."c" if defined($oid_perf_outoct[$i]) && defined($$resultf{$oid_perf_outoct[$i]});
+        $perf_out .= " ".perf_name($descr[$i],"in_octet")."=". $$resultf{$oid_perf_inoct[$i]} ."c" if defined($oid_perf_inoct[$i]) && defined($$resultf{$oid_perf_inoct[$i]}) && $$resultf{$oid_perf_inoct[$i]} =~ /\A\d+\z/;
+        $perf_out .= " ".perf_name($descr[$i],"out_octet")."=". $$resultf{$oid_perf_outoct[$i]} ."c" if defined($oid_perf_outoct[$i]) && defined($$resultf{$oid_perf_outoct[$i]}) && $$resultf{$oid_perf_outoct[$i]} =~ /\A\d+\z/;
     }
     if (defined ($o_perfe)) {
         $perf_out .= " ".perf_name($descr[$i],"in_error")."=". $$resultf{$oid_perf_inerr[$i]} ."c" if defined $$resultf{$oid_perf_inerr[$i]};
@@ -2161,6 +2210,9 @@ if (defined($o_prevperf) && $o_pcount>0) {
   for (my $i=0; $i<$num_int; $i++) {
     $pcount=0;
     foreach $loop_time (reverse sort(@prev_time)) {
+        next if defined($o_autocounters) &&
+            (!defined($prev_perf{perf_name($descr[$i], 'counter_bits')}) ||
+             $prev_perf{perf_name($descr[$i], 'counter_bits')} != ($counter_bits[$i] || 0));
       if (defined($descr[$i]) && $pcount<($o_pcount-1)) {
         my $pnpref='.'.$loop_time;
         $pnpref='' if defined($prev_perf{ptime}) && $prev_perf{ptime} eq $loop_time;

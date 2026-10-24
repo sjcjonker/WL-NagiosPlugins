@@ -24,6 +24,22 @@ starts from `willixix/WL-NagiosPlugins` commit
 No history deletion, SNMP agent changes or new runtime dependencies are needed.
 Other plugins in this repository are unchanged.
 
+## Automatic counter selection
+
+Use `--autocounters` with SNMPv2c/v3 to probe both byte-counter pairs in the
+statistics request. Each interface selects a complete numeric 64-bit in/out
+pair first, or a complete numeric 32-bit pair otherwise. Partial pairs are
+never mixed. Neither pair available means UNKNOWN. Timeouts remain request
+failures, not evidence of unsupported counters. Explicit legacy -g/32-bit
+behavior is preserved when this option is omitted.
+
+Status text reports `counters=32-bit` or `counters=64-bit`. A zero/unknown
+link speed does not prevent selection. Automatic file history stores the
+selected width in an extra column; -P history uses a counter_bits metric.
+Legacy history or a width change rebuilds the baseline. Plan for an initial
+UNKNOWN window on rollout. Invalid byte-counter values are omitted from
+numeric performance data instead of emitting strings such as noSuchObjectc.
+
 Run the executable regression tests (Python 3 and Perl):
 
 ```sh
