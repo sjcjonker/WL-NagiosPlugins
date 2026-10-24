@@ -956,6 +956,35 @@ sub perf_name2 {
   return $iname."_".$vtype;
 }
 
+# Return false for counter resets, invalid samples and impossible byte rates.
+# A 64-bit wrap cannot occur at realistic link rates; keep 32-bit wraps.
+sub valid_rate_sample {
+    my ($row, $items) = @_;
+    return 0 unless ref($row) eq 'ARRAY' && @$row >= $items;
+    for my $k (0 .. $items-1) {
+        return 0 unless defined($row->[$k]) && $row->[$k] =~ /\A\d+\z/;
+    }
+    return $row->[0] > 0;
+}
+
+sub valid_rate_pair {
+    my ($old, $new, $highperf, $speed, $items) = @_;
+    return 0 unless valid_rate_sample($old, $items) && valid_rate_sample($new, $items);
+    my $elapsed = $new->[0] - $old->[0];
+    return 0 unless $elapsed > 0;
+    for my $k (1 .. $items-1) {
+        my $delta = $new->[$k] - $old->[$k];
+        if ($delta < 0) {
+            return 0 if $highperf || $k > 2;
+            $delta += 4294967296;
+        }
+        # Permit 10% sampling skew; unknown/zero link speeds have no rate bound.
+        return 0 if $k <= 2 && defined($speed) && $speed > 0
+            && $delta * 8 > $speed * $elapsed * 1.10;
+    }
+    return 1;
+}
+
 sub check_options {
     Getopt::Long::Configure ("bundling");
 	GetOptions(
@@ -1176,7 +1205,7 @@ sub check_options {
 	}
     }
     # do we need to retrieve port speed data or not
-    $check_speed = 1 if defined($o_prct) || defined($o_perfs) || defined($o_perfp);
+    $check_speed = 1 if defined($o_checkperf) || defined($o_prct) || defined($o_perfs) || defined($o_perfp);
     $expected_speed = $1 if defined($o_perfs) && $o_perfs =~ /(\d+)/;
     $expected_speed = $expected_speed*1000*1000 if $expected_speed!=0 && $o_perfs =~ /Mb/;
     $expected_speed = $expected_speed*1000 if $expected_speed!=0 && $o_perfs =~ /Kb/;
@@ -1812,7 +1841,7 @@ for (my $i=0;$i < $num_int; $i++) {
         my @ret_array=read_file($temp_file_name,$n_items_check);
         $usable_data = shift(@ret_array);
         $n_rows = shift(@ret_array);
-        if ($n_rows != 0) { @prev_values = @ret_array };
+        @prev_values = @ret_array;
         verb ("File read returns : $usable_data with $n_rows rows");
         verb ("Interface speed : $portspeed[$i]") if defined($portspeed[$i]);
     }
@@ -1844,7 +1873,7 @@ for (my $i=0;$i < $num_int; $i++) {
 				$data_ok=0 if $k<3;
 			}
 		}
-		if ($data_ok && $prev_values[$jj][1]!=0 && $prev_values[$jj][2]!=0) {
+		if ($data_ok) {
 			$jj++;
 		}
 		else {
@@ -1856,17 +1885,30 @@ for (my $i=0;$i < $num_int; $i++) {
 	  else { $usable_data=0; } # OK
     }
     verb("Previous data array created: $n_rows rows");
-    # Put the new values in the array
-    if (defined($$resultf{$oid_perf_inoct[$i]}) && defined($$resultf{$oid_perf_outoct[$i]})) {
-        $prev_values[$n_rows]=[ $timenow, $$resultf{$oid_perf_inoct[$i]}, $$resultf{$oid_perf_outoct[$i]}, 0,0,0,0 ];
-        if (defined($o_ext_checkperf)) { # Add other values (error & disc)
-          $prev_values[$n_rows][3]=$$resultf{$oid_perf_inerr[$i]} if defined($$resultf{$oid_perf_inerr[$i]});
-          $prev_values[$n_rows][4]=$$resultf{$oid_perf_outerr[$i]} if defined($$resultf{$oid_perf_outerr[$i]});
-          $prev_values[$n_rows][5]=$$resultf{$oid_perf_indisc[$i]} if defined($$resultf{$oid_perf_indisc[$i]});
-          $prev_values[$n_rows][6]=$$resultf{$oid_perf_outdisc[$i]} if defined($$resultf{$oid_perf_outdisc[$i]});
-        }
-	$n_rows++;
+    # Keep only the contiguous valid history after the most recent reset.
+    # This also repairs existing history files without manual deletion.
+    my $rate_reason = 'waiting for rate samples';
+    my @current = ($timenow, $$resultf{$oid_perf_inoct[$i]}, $$resultf{$oid_perf_outoct[$i]});
+    if (defined($o_ext_checkperf)) {
+        push @current, map { $$resultf{$_} }
+            ($oid_perf_inerr[$i], $oid_perf_outerr[$i], $oid_perf_indisc[$i], $oid_perf_outdisc[$i]);
     }
+    my @clean;
+    for my $row (@prev_values[0 .. $n_rows-1], \@current) {
+        unless (valid_rate_sample($row, $n_items_check) && $row->[0] <= $timenow) {
+            @clean = ();
+            $rate_reason = 'missing or invalid counters';
+            next;
+        }
+        if (@clean && !valid_rate_pair($clean[-1], $row, defined($o_highperf), $portspeed[$i], $n_items_check)) {
+            @clean = ();
+            $rate_reason = 'counter discontinuity or implausible rate; rebuilding baseline';
+        }
+        push @clean, $row;
+    }
+    @prev_values = @clean;
+    $n_rows = scalar(@prev_values);
+    $usable_data = $n_rows >= 2 ? 0 : 1;
     #make the checks if the file is OK
     if ($usable_data==0) {
       my $j;
@@ -1880,7 +1922,7 @@ for (my $i=0;$i < $num_int; $i++) {
       $checkval_tdiff=undef;
 
       # Calculate averages & metrics
-      $j=$n_rows-1;
+      $j=$n_rows-2;
       do {
 	if ($prev_values[$j][0] < $trigger) {
 	  if ($prev_values[$j][0] > $trigger_low) {
@@ -1920,15 +1962,15 @@ for (my $i=0;$i < $num_int; $i++) {
 
 	    if (($checkval_tdiff=$prev_values[$j+1][0]-$prev_values[$j][0])!=0) {
               # check_perf_out_raw is array used to store calculations from multiple counts
-              $checkperf_out_raw[$jj] = [ 0,0,0,0,0 ];
+              $checkperf_out_raw[$jj] = [ 0,0,0,0,0,0 ];
 
 	      # Check counter (s)
-	      if ($prev_values[$j+1][1]!=0 && $prev_values[$j][1]!=0) {
+	      if (defined($prev_values[$j+1][1]) && defined($prev_values[$j][1])) {
 	        $overfl = ($prev_values[$j+1][1] >= $prev_values[$j][1] ) ? 0 : $overfl_mod;
 	        $checkval_in = ($overfl + $prev_values[$j+1][1] - $prev_values[$j][1]) / $checkval_tdiff ;
 	        $checkperf_out_raw[$jj][0] = $checkval_in / $speed_metric;
 	      }
-	      if ($prev_values[$j+1][2]!=0 && $prev_values[$j][2]!=0) {
+	      if (defined($prev_values[$j+1][2]) && defined($prev_values[$j][2])) {
 	    	$overfl = ($prev_values[$j+1][2] >= $prev_values[$j][2] ) ? 0 : $overfl_mod;
 	        $checkval_out = ($overfl + $prev_values[$j+1][2] - $prev_values[$j][2]) / $checkval_tdiff;
 	        $checkperf_out_raw[$jj][1] = $checkval_out / $speed_metric;
@@ -1939,7 +1981,7 @@ for (my $i=0;$i < $num_int; $i++) {
 	        $checkperf_out_raw[$jj][4] = ( ($prev_values[$j+1][5] - $prev_values[$j][5])/ $checkval_tdiff )*60;
 	        $checkperf_out_raw[$jj][5] = ( ($prev_values[$j+1][6] - $prev_values[$j][6])/ $checkval_tdiff )*60;
 	      }
-	      $jj++ if $checkperf_out_raw[$jj][0]!=0 || $checkperf_out_raw[$jj][1]!=0;
+	      $jj++; # A valid idle interval is a real zero-rate sample.
 	    }
 	  }
 	}
@@ -1948,10 +1990,10 @@ for (my $i=0;$i < $num_int; $i++) {
 
       # Calculate total as average
       if ($jj>0) {
-        for (my $k=0;$k<5;$k++) {
+        for (my $k=0;$k<(defined($o_ext_checkperf)?6:2);$k++) {
           $n=0;
           for ($j=0;$j<$jj;$j++) {
-	    if ($checkperf_out_raw[$j][$k]!=0) {
+	    if (defined($checkperf_out_raw[$j][$k])) {
 	      $n++;
 	      $checkperf_out[$k]+=$checkperf_out_raw[$j][$k];
             }
@@ -2002,9 +2044,8 @@ for (my $i=0;$i < $num_int; $i++) {
       $print_out .= ")";
     }
     else { # Return unknown when no data
-      $print_out.= " (no usable data - ".$n_rows." rows) ";
-      # WL: I've removed return of UNKNOWN if no data is available, when plugin is first used that may well happen
-      # $final_status=3;
+      $print_out.= " (rate unavailable: ".$rate_reason." - ".$n_rows." rows) ";
+      $final_status=3 if $final_status==0;
     }
   }
   else {
