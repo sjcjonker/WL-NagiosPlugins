@@ -532,6 +532,10 @@
 # ============================ START OF PROGRAM CODE =============================
 
 use strict;
+use Digest::SHA qw(sha256_hex);
+use File::Basename qw(dirname);
+use File::Temp qw(tempfile);
+use Fcntl qw(:DEFAULT :flock O_NOFOLLOW);
 use Getopt::Long;
 use Text::ParseWords;
 
@@ -555,7 +559,7 @@ if ($@) {
 my $Version='2.36';
 
 ############### BASE DIRECTORY FOR TEMP FILE (override this with -F) ########
-my $o_base_dir="/tmp/tmp_Nagios_int.";
+my $o_state_dir="/var/spool/nagios/interfaces";
 my $file_history=200;   # number of data to keep in files.
 
 # SNMP OID Datas
@@ -653,7 +657,7 @@ my $o_prevtime=         undef;  # previous time plugin was run $LASTSERVICECHECK
 my @o_minsnmp=		();     # see below
 my $o_minsnmp=		undef;	# minimize number of snmp queries
 my $o_maxminsnmp=	undef;  # minimize number of snmp queries even futher (slightly less safe in case of switch config changes)
-my $o_filestore=        undef;  # path of the file to store cached data in - overrides $o_base_dir
+my $o_filestore=        undef;  # path of the file to store cached data in - overrides the automatic history path
 my $o_pcount=		2;	# how many sets of previous data should be in performance data
 
 # These are unrelated WL's contribs to override default description OID 1.3.6.1.2.1.2.2.1.2 and for stp and cisco m[a|y]stery
@@ -697,7 +701,9 @@ sub read_file {
   my ($traffic_file,$items_number)=@_;
   my ($ligne,$n_rows)=(undef,0);
   my (@last_values,@file_values,$i);
-  open(FILE,"<".$traffic_file) || return (1,0,0);
+  return (1,0,0) if -l $traffic_file;
+  sysopen(FILE, $traffic_file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) || return (1,0,0);
+  unless (-f FILE && -s FILE <= 1048576) { close FILE; return (1,0,0); }
 
   while($ligne = <FILE>)
   {
@@ -719,24 +725,30 @@ sub read_file {
 }
 
 sub write_file {
-  # Input : file , rows, items, array of value : [line][item]
-  # Returns : 0 / OK, 1 / error
   my ($file_out,$rows,$item,@file_values)=@_;
-  my $start_line= ($rows > $file_history) ? $rows -  $file_history : 0;
-  if ( open(FILE2,">".$file_out) ) {
-    for (my $i=$start_line;$i<$rows;$i++) {
-      for (my $j=0;$j<$item;$j++) {
-	print FILE2 $file_values[$i][$j];
-	if ($j != ($item -1)) { print FILE2 ":" };
-      }
-      print FILE2 "\n";
-    }
-    close FILE2;
-    return 0;
-  } else {
-    return 1;
+  return 1 if -l $file_out;
+  my ($fh, $temporary);
+  eval { ($fh, $temporary) = tempfile('.netint-XXXXXXXX', DIR => dirname($file_out), UNLINK => 1); };
+  return 1 unless defined($fh);
+  my $start_line= ($rows > $file_history) ? $rows - $file_history : 0;
+  my $ok = 1;
+  for (my $i=$start_line;$i<$rows;$i++) {
+    $ok &&= print {$fh} join(':', @{$file_values[$i]}[0 .. $item-1]), "\n";
   }
+  $ok = close($fh) && $ok;
+  if ($ok && rename($temporary, $file_out)) { return 0; }
+  unlink($temporary);
+  return 1;
 }
+
+# Default identity is independent of command-line quoting and cannot escape the
+# private state directory through an SNMP-controlled interface description.
+sub default_history_path {
+  my ($host, $port, $description, $index) = @_;
+  my $identity = join("\0", $host, $port, $description, $index);
+  return $o_state_dir . '/int.' . sha256_hex($identity);
+}
+
 
 sub p_version { print "check_snmp_netint version : $Version\n"; }
 
@@ -835,6 +847,11 @@ sub help {
    at least couple sets allows for more realistic and less 'bursty' results
    but nagios has buffer limits so very large output of performance data
    would not be kept. Default is now 2 sets.
+--state-dir=PATH
+   Directory for automatic per-host/port/interface history files.
+   Default: /var/spool/nagios/interfaces (must exist, no group/other write).
+   -F still overrides the complete filename for compatibility.
+
 -d, --delta=seconds
    make an average of <delta> seconds (default 300=5min)
 -m, --minimize_queries | -mm, --minimum_queries
@@ -1040,6 +1057,7 @@ sub check_options {
 	'T:s'   => \$o_prevtime,        'prev_checktime:s'=> \$o_prevtime,
 	'pcount:i' => \$o_pcount,
 	'm'	=> \@o_minsnmp,		'minimize_queries' => \$o_minsnmp,  'minimum_queries'    => \$o_maxminsnmp,
+	'state-dir=s' => \$o_state_dir,
 	'F:s'   => \$o_filestore,       'filestore:s' => \$o_filestore,
 	'cisco:s' => \$o_ciscocat,	'stp:s' =>	\$o_stp
     );
@@ -1579,11 +1597,22 @@ if (defined($o_perf) || defined($o_checkperf) || $expected_speed!=0) {
 if (defined($o_autocounters) && defined($resultf)) {
     for my $i (0 .. $num_int-1) {
         $counter_bits[$i] = 0;
+        my $low_in = '1.3.6.1.2.1.2.2.1.10.' . $tindex[$i];
+        my $low_out = '1.3.6.1.2.1.2.2.1.16.' . $tindex[$i];
         for my $bits (64, 32) {
             my $in = ($bits == 64 ? $in_octet_table_64 : '1.3.6.1.2.1.2.2.1.10.') . $tindex[$i];
             my $out = ($bits == 64 ? $out_octet_table_64 : '1.3.6.1.2.1.2.2.1.16.') . $tindex[$i];
             if (defined($resultf->{$in}) && $resultf->{$in} =~ /\A\d+\z/
                 && defined($resultf->{$out}) && $resultf->{$out} =~ /\A\d+\z/) {
+                # Some agents expose Counter32 values as Counter64 as well.
+                # Identical low values are not evidence of 64-bit continuity;
+                # prefer the actual Counter32 pair until HC values diverge.
+                next if $bits == 64
+                    && defined($resultf->{$low_in}) && $resultf->{$low_in} =~ /\A\d+\z/
+                    && defined($resultf->{$low_out}) && $resultf->{$low_out} =~ /\A\d+\z/
+                    && $resultf->{$in} <= 4294967295 && $resultf->{$out} <= 4294967295
+                    && $resultf->{$in} == $resultf->{$low_in}
+                    && $resultf->{$out} == $resultf->{$low_out};
                 ($oid_perf_inoct[$i], $oid_perf_outoct[$i]) = ($in, $out);
                 $counter_bits[$i] = $bits;
                 last;
@@ -1868,15 +1897,28 @@ for (my $i=0;$i < $num_int; $i++) {
 
   # Make the bandwith & error checks if necessary
   if (defined ($o_checkperf) && $int_status==1) {
+    my $history_lock;
     # WL: checks if previous performance data & time last check was run are available
     if ($o_filestore || !defined($o_prevperf)) {
         if ($o_filestore && length($o_filestore)>1) {
 	  $temp_file_name=$o_filestore;
         }
         else {
-	  $temp_file_name=$descr[$i];
-	  $temp_file_name =~ s/[ ;\/]/_/g;
-	  $temp_file_name = $o_base_dir . $o_host ."." . $temp_file_name;
+          unless (-d $o_state_dir && !-l $o_state_dir
+              && ((stat($o_state_dir))[2] & 0022) == 0
+              && ((stat($o_state_dir))[4] == 0 || (stat($o_state_dir))[4] == $>)) {
+              print "UNKNOWN - history directory missing or writable by group/others\n";
+              exit $ERRORS{"UNKNOWN"};
+          }
+          $temp_file_name = default_history_path($o_host, $o_port, $descr[$i], $tindex[$i]);
+        }
+        # Serialize the complete read/modify/write operation for this interface.
+        # Refuse symlinks and files not owned by this check's effective UID.
+        unless (sysopen($history_lock, $temp_file_name . '.lock', O_RDWR | O_CREAT | O_NOFOLLOW, 0600)
+            && -f $history_lock && (stat($history_lock))[4] == $>
+            && (stat($history_lock))[3] == 1 && flock($history_lock, LOCK_EX | LOCK_NB)) {
+            print "UNKNOWN - cannot lock interface history\n";
+            exit $ERRORS{"UNKNOWN"};
         }
         # First, read entire file
         my @ret_array=read_file($temp_file_name,$n_items_check + (defined($o_autocounters) ? 1 : 0));
@@ -2258,3 +2300,4 @@ else {
 print " | ",$perf_out if defined($perf_out);
 print "\n";
 exit $ERRORS{$exit_status};
+
