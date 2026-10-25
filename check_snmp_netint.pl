@@ -532,6 +532,10 @@
 # ============================ START OF PROGRAM CODE =============================
 
 use strict;
+use Digest::SHA qw(sha256_hex);
+use File::Basename qw(dirname);
+use File::Temp qw(tempfile);
+use Fcntl qw(:DEFAULT :flock O_NOFOLLOW);
 use Getopt::Long;
 use Text::ParseWords;
 
@@ -555,7 +559,7 @@ if ($@) {
 my $Version='2.36';
 
 ############### BASE DIRECTORY FOR TEMP FILE (override this with -F) ########
-my $o_base_dir="/tmp/tmp_Nagios_int.";
+my $o_state_dir="/var/spool/nagios/interfaces";
 my $file_history=200;   # number of data to keep in files.
 
 # SNMP OID Datas
@@ -619,6 +623,9 @@ my @o_crit_max=         undef;  # critical levels of perfcheck
 my $o_checkperf=	undef;	# checks in/out/err/disc values
 my $o_delta=		300;	# delta of time of perfcheck (default 5min)
 my $o_ext_checkperf=	undef;  # extended perf checks (+error+discard)
+my $o_autocounters;              # Prefer a complete Counter64 pair, otherwise Counter32
+my @counter_bits;
+my @oid_auto;
 my $o_highperf=         undef;  # Use 64 bits counters
 my $o_meg=              undef;  # output in MBytes or Mbits (-M)
 my $o_gig=              undef;  # output in GBytes or Gbits (-G)
@@ -650,7 +657,7 @@ my $o_prevtime=         undef;  # previous time plugin was run $LASTSERVICECHECK
 my @o_minsnmp=		();     # see below
 my $o_minsnmp=		undef;	# minimize number of snmp queries
 my $o_maxminsnmp=	undef;  # minimize number of snmp queries even futher (slightly less safe in case of switch config changes)
-my $o_filestore=        undef;  # path of the file to store cached data in - overrides $o_base_dir
+my $o_filestore=        undef;  # path of the file to store cached data in - overrides the automatic history path
 my $o_pcount=		2;	# how many sets of previous data should be in performance data
 
 # These are unrelated WL's contribs to override default description OID 1.3.6.1.2.1.2.2.1.2 and for stp and cisco m[a|y]stery
@@ -694,7 +701,9 @@ sub read_file {
   my ($traffic_file,$items_number)=@_;
   my ($ligne,$n_rows)=(undef,0);
   my (@last_values,@file_values,$i);
-  open(FILE,"<".$traffic_file) || return (1,0,0);
+  return (1,0,0) if -l $traffic_file;
+  sysopen(FILE, $traffic_file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) || return (1,0,0);
+  unless (-f FILE && -s FILE <= 1048576) { close FILE; return (1,0,0); }
 
   while($ligne = <FILE>)
   {
@@ -716,24 +725,30 @@ sub read_file {
 }
 
 sub write_file {
-  # Input : file , rows, items, array of value : [line][item]
-  # Returns : 0 / OK, 1 / error
   my ($file_out,$rows,$item,@file_values)=@_;
-  my $start_line= ($rows > $file_history) ? $rows -  $file_history : 0;
-  if ( open(FILE2,">".$file_out) ) {
-    for (my $i=$start_line;$i<$rows;$i++) {
-      for (my $j=0;$j<$item;$j++) {
-	print FILE2 $file_values[$i][$j];
-	if ($j != ($item -1)) { print FILE2 ":" };
-      }
-      print FILE2 "\n";
-    }
-    close FILE2;
-    return 0;
-  } else {
-    return 1;
+  return 1 if -l $file_out;
+  my ($fh, $temporary);
+  eval { ($fh, $temporary) = tempfile('.netint-XXXXXXXX', DIR => dirname($file_out), UNLINK => 1); };
+  return 1 unless defined($fh);
+  my $start_line= ($rows > $file_history) ? $rows - $file_history : 0;
+  my $ok = 1;
+  for (my $i=$start_line;$i<$rows;$i++) {
+    $ok &&= print {$fh} join(':', @{$file_values[$i]}[0 .. $item-1]), "\n";
   }
+  $ok = close($fh) && $ok;
+  if ($ok && rename($temporary, $file_out)) { return 0; }
+  unlink($temporary);
+  return 1;
 }
+
+# Default identity is independent of command-line quoting and cannot escape the
+# private state directory through an SNMP-controlled interface description.
+sub default_history_path {
+  my ($host, $port, $description, $index) = @_;
+  my $identity = join("\0", $host, $port, $description, $index);
+  return $o_state_dir . '/int.' . sha256_hex($identity);
+}
+
 
 sub p_version { print "check_snmp_netint version : $Version\n"; }
 
@@ -832,6 +847,11 @@ sub help {
    at least couple sets allows for more realistic and less 'bursty' results
    but nagios has buffer limits so very large output of performance data
    would not be kept. Default is now 2 sets.
+--state-dir=PATH
+   Directory for automatic per-host/port/interface history files.
+   Default: /var/spool/nagios/interfaces (must exist, no group/other write).
+   -F still overrides the complete filename for compatibility.
+
 -d, --delta=seconds
    make an average of <delta> seconds (default 300=5min)
 -m, --minimize_queries | -mm, --minimum_queries
@@ -860,6 +880,10 @@ sub help {
    the port and plugin will return CRITICAL error if its anything else.
 --label
    Add label before speed in output : in=, out=, errors-out=, etc...
+--autocounters
+   Select counters per interface: prefer a complete 64-bit in/out pair, else
+   use a complete 32-bit pair. Requires SNMPv2c/v3. Overrides -g.
+   A counter-width change rebuilds the rate baseline. Neither pair => UNKNOWN.
 -g, --64bits
    Use 64 bits counters instead of the standard counters when checking
    bandwidth & performance data for interface >= 1Gbps.
@@ -956,6 +980,35 @@ sub perf_name2 {
   return $iname."_".$vtype;
 }
 
+# Return false for counter resets, invalid samples and impossible byte rates.
+# A 64-bit wrap cannot occur at realistic link rates; keep 32-bit wraps.
+sub valid_rate_sample {
+    my ($row, $items) = @_;
+    return 0 unless ref($row) eq 'ARRAY' && @$row >= $items;
+    for my $k (0 .. $items-1) {
+        return 0 unless defined($row->[$k]) && $row->[$k] =~ /\A\d+\z/;
+    }
+    return $row->[0] > 0;
+}
+
+sub valid_rate_pair {
+    my ($old, $new, $highperf, $speed, $items) = @_;
+    return 0 unless valid_rate_sample($old, $items) && valid_rate_sample($new, $items);
+    my $elapsed = $new->[0] - $old->[0];
+    return 0 unless $elapsed > 0;
+    for my $k (1 .. $items-1) {
+        my $delta = $new->[$k] - $old->[$k];
+        if ($delta < 0) {
+            return 0 if $highperf || $k > 2;
+            $delta += 4294967296;
+        }
+        # Permit 10% sampling skew; unknown/zero link speeds have no rate bound.
+        return 0 if $k <= 2 && defined($speed) && $speed > 0
+            && $delta * 8 > $speed * $elapsed * 1.10;
+    }
+    return 1;
+}
+
 sub check_options {
     Getopt::Long::Configure ("bundling");
 	GetOptions(
@@ -986,6 +1039,7 @@ sub check_options {
 	'z'	=> \$o_zerothresholds,	'zerothresholds' => \$o_zerothresholds,
         'B'     => \$o_kbits,           'kbits'         => \$o_kbits,
         's:i'   => \$o_short,      	'short:i'   	=> \$o_short,
+        'autocounters' => \$o_autocounters,
         'g'   	=> \$o_highperf,      	'64bits'   	=> \$o_highperf,
         'S:s'   => \$o_perfs,      	'intspeed:s'   	=> \$o_perfs,
         'y'   	=> \$o_perfp,      	'perfprct'   	=> \$o_perfp,
@@ -1003,6 +1057,7 @@ sub check_options {
 	'T:s'   => \$o_prevtime,        'prev_checktime:s'=> \$o_prevtime,
 	'pcount:i' => \$o_pcount,
 	'm'	=> \@o_minsnmp,		'minimize_queries' => \$o_minsnmp,  'minimum_queries'    => \$o_maxminsnmp,
+	'state-dir=s' => \$o_state_dir,
 	'F:s'   => \$o_filestore,       'filestore:s' => \$o_filestore,
 	'cisco:s' => \$o_ciscocat,	'stp:s' =>	\$o_stp
     );
@@ -1030,9 +1085,9 @@ sub check_options {
 	{ print "Timeout must be >1 and <60 !\n"; print_usage(); exit $ERRORS{"UNKNOWN"}}
     if (!defined($o_timeout)) {$o_timeout=5;}
     # Check snmpv2c or v3 with 64 bit counters
-    if ( defined ($o_highperf) && (!defined($o_version2) && defined($o_community)))
+    if ( (defined($o_highperf) || defined($o_autocounters)) && (!defined($o_version2) && defined($o_community)))
       { print "Can't get 64 bit counters with snmp version 1\n"; print_usage(); exit $ERRORS{"UNKNOWN"}}
-    if (defined ($o_highperf)) {
+    if (defined($o_highperf) || defined($o_autocounters)) {
       if (eval "require bigint") {
         use bigint;
       } else  { print "Need bigint module for 64 bit counters\n"; print_usage(); exit $ERRORS{"UNKNOWN"}}
@@ -1176,7 +1231,7 @@ sub check_options {
 	}
     }
     # do we need to retrieve port speed data or not
-    $check_speed = 1 if defined($o_prct) || defined($o_perfs) || defined($o_perfp);
+    $check_speed = 1 if defined($o_checkperf) || defined($o_prct) || defined($o_perfs) || defined($o_perfp);
     $expected_speed = $1 if defined($o_perfs) && $o_perfs =~ /(\d+)/;
     $expected_speed = $expected_speed*1000*1000 if $expected_speed!=0 && $o_perfs =~ /Mb/;
     $expected_speed = $expected_speed*1000 if $expected_speed!=0 && $o_perfs =~ /Kb/;
@@ -1456,6 +1511,11 @@ for (my $i=0;$i<$num_int;$i++) {
      if (defined($o_perf) || defined($o_checkperf)) {
        $oid_perf_inoct[$i]= $in_octet_table . $tindex[$i];
        $oid_perf_outoct[$i]= $out_octet_table . $tindex[$i];
+       if (defined($o_autocounters)) {
+           push @oid_auto, map { $_ . $tindex[$i] }
+               ('1.3.6.1.2.1.2.2.1.10.', '1.3.6.1.2.1.2.2.1.16.',
+                $in_octet_table_64, $out_octet_table_64);
+       }
        if (defined($o_ext_checkperf) || defined($o_perfe)) {
 	 $oid_perf_indisc[$i]= $in_discard_table . $tindex[$i];
 	 $oid_perf_outdisc[$i]= $out_discard_table . $tindex[$i];
@@ -1483,12 +1543,16 @@ if ( $num_int == 0 ) { print "ERROR : Unknown interface $o_descr\n" ; exit $ERRO
 # WL: do it as one query when -m option is used
 if (defined($o_perf) || defined($o_checkperf) || $expected_speed!=0) {
   @oid_perf=(@oid_perf_outoct,@oid_perf_inoct,@oid_speed);
-  if (defined($o_highperf)) {
+  if (defined($o_highperf) || defined($o_autocounters)) {
     @oid_perf=(@oid_perf,@oid_speed_high);
   }
   if (defined ($o_ext_checkperf) || defined($o_perfe)) {
     @oid_perf=(@oid_perf,@oid_perf_inerr,@oid_perf_outerr,@oid_perf_indisc,@oid_perf_outdisc);
   }
+}
+if (defined($o_autocounters)) {
+    my %seen;
+    @oid_perf = grep { defined($_) && !$seen{$_}++ } (@oid_perf, @oid_auto);
 }
 if (defined($o_ciscocat)) {
 	@oid_ciscostatus=(@oid_ciscofaultstatus,@oid_ciscooperstatus,@oid_ciscoaddoperstatus);
@@ -1528,6 +1592,35 @@ if (defined($o_perf) || defined($o_checkperf) || $expected_speed!=0) {
         $resultf = $result;
    }
 }
+# Probe both widths in the same statistics request. SNMPv2 exceptions describe
+# unsupported OIDs; a timeout is still a failed request, not a fallback signal.
+if (defined($o_autocounters) && defined($resultf)) {
+    for my $i (0 .. $num_int-1) {
+        $counter_bits[$i] = 0;
+        my $low_in = '1.3.6.1.2.1.2.2.1.10.' . $tindex[$i];
+        my $low_out = '1.3.6.1.2.1.2.2.1.16.' . $tindex[$i];
+        for my $bits (64, 32) {
+            my $in = ($bits == 64 ? $in_octet_table_64 : '1.3.6.1.2.1.2.2.1.10.') . $tindex[$i];
+            my $out = ($bits == 64 ? $out_octet_table_64 : '1.3.6.1.2.1.2.2.1.16.') . $tindex[$i];
+            if (defined($resultf->{$in}) && $resultf->{$in} =~ /\A\d+\z/
+                && defined($resultf->{$out}) && $resultf->{$out} =~ /\A\d+\z/) {
+                # Some agents expose Counter32 values as Counter64 as well.
+                # Identical low values are not evidence of 64-bit continuity;
+                # prefer the actual Counter32 pair until HC values diverge.
+                next if $bits == 64
+                    && defined($resultf->{$low_in}) && $resultf->{$low_in} =~ /\A\d+\z/
+                    && defined($resultf->{$low_out}) && $resultf->{$low_out} =~ /\A\d+\z/
+                    && $resultf->{$in} <= 4294967295 && $resultf->{$out} <= 4294967295
+                    && $resultf->{$in} == $resultf->{$low_in}
+                    && $resultf->{$out} == $resultf->{$low_out};
+                ($oid_perf_inoct[$i], $oid_perf_outoct[$i]) = ($in, $out);
+                $counter_bits[$i] = $bits;
+                last;
+            }
+        }
+    }
+}
+
 # Additional cisco status tables
 if (defined($o_ciscocat)) {
    if (!defined($o_minsnmp) && scalar(@oid_ciscostatus)>0) {
@@ -1623,6 +1716,10 @@ for (my $i=0;$i < $num_int; $i++) {
   }
   my $int_status_opt = 0;
   my $int_status_extratext = "";
+  my $bits = defined($o_autocounters) ? ($counter_bits[$i] || 0) : (defined($o_highperf) ? 64 : 32);
+  $int_status_extratext = $bits ? "counters=$bits-bit" : 'counters=unavailable' if defined($o_autocounters);
+  $final_status=3 if defined($o_autocounters) && !$bits
+      && (defined($o_perf) || defined($o_checkperf)) && $final_status==0;
 
   # WL: First verify description is correct when -m option (but not --mm) is used
   if (defined($o_minsnmp) && !defined($o_maxminsnmp)) {
@@ -1665,6 +1762,8 @@ for (my $i=0;$i < $num_int; $i++) {
                 $int_desc.='('.$$resulto{$o_commentoid.$tindex[$i]}.')' if $$resulto{$o_commentoid.$tindex[$i]};
         }
   }
+
+  $perf_out .= " ".perf_name($descr[$i], 'counter_bits')."=".$bits if defined($o_autocounters) && $bits;
 
   # WL: Additional cisco status data
   if (defined($o_ciscocat) && $cport[$i]) {
@@ -1774,7 +1873,7 @@ for (my $i=0;$i < $num_int; $i++) {
   # Get the speed in normal or highperf speed counters
   if (defined($oid_speed[$i]) && defined($$resultf{$oid_speed[$i]})) {
       if ($$resultf{$oid_speed[$i]} == 4294967295) { # Too high for this counter (cf IF-MIB)
-          if (! defined($o_highperf) && (defined($o_prct) || defined ($o_perfs) || defined ($o_perfp))) {
+          if (!defined($o_highperf) && !defined($o_autocounters) && (defined($o_prct) || defined ($o_perfs) || defined ($o_perfp))) {
               print "Cannot get interface speed with standard MIB, use highperf mib (-g) : UNKNOWN\n";
               exit $ERRORS{"UNKNOWN"}
           }
@@ -1798,21 +1897,34 @@ for (my $i=0;$i < $num_int; $i++) {
 
   # Make the bandwith & error checks if necessary
   if (defined ($o_checkperf) && $int_status==1) {
+    my $history_lock;
     # WL: checks if previous performance data & time last check was run are available
     if ($o_filestore || !defined($o_prevperf)) {
         if ($o_filestore && length($o_filestore)>1) {
 	  $temp_file_name=$o_filestore;
         }
         else {
-	  $temp_file_name=$descr[$i];
-	  $temp_file_name =~ s/[ ;\/]/_/g;
-	  $temp_file_name = $o_base_dir . $o_host ."." . $temp_file_name;
+          unless (-d $o_state_dir && !-l $o_state_dir
+              && ((stat($o_state_dir))[2] & 0022) == 0
+              && ((stat($o_state_dir))[4] == 0 || (stat($o_state_dir))[4] == $>)) {
+              print "UNKNOWN - history directory missing or writable by group/others\n";
+              exit $ERRORS{"UNKNOWN"};
+          }
+          $temp_file_name = default_history_path($o_host, $o_port, $descr[$i], $tindex[$i]);
+        }
+        # Serialize the complete read/modify/write operation for this interface.
+        # Refuse symlinks and files not owned by this check's effective UID.
+        unless (sysopen($history_lock, $temp_file_name . '.lock', O_RDWR | O_CREAT | O_NOFOLLOW, 0600)
+            && -f $history_lock && (stat($history_lock))[4] == $>
+            && (stat($history_lock))[3] == 1 && flock($history_lock, LOCK_EX | LOCK_NB)) {
+            print "UNKNOWN - cannot lock interface history\n";
+            exit $ERRORS{"UNKNOWN"};
         }
         # First, read entire file
-        my @ret_array=read_file($temp_file_name,$n_items_check);
+        my @ret_array=read_file($temp_file_name,$n_items_check + (defined($o_autocounters) ? 1 : 0));
         $usable_data = shift(@ret_array);
         $n_rows = shift(@ret_array);
-        if ($n_rows != 0) { @prev_values = @ret_array };
+        @prev_values = @ret_array;
         verb ("File read returns : $usable_data with $n_rows rows");
         verb ("Interface speed : $portspeed[$i]") if defined($portspeed[$i]);
     }
@@ -1844,7 +1956,7 @@ for (my $i=0;$i < $num_int; $i++) {
 				$data_ok=0 if $k<3;
 			}
 		}
-		if ($data_ok && $prev_values[$jj][1]!=0 && $prev_values[$jj][2]!=0) {
+		if ($data_ok) {
 			$jj++;
 		}
 		else {
@@ -1855,18 +1967,39 @@ for (my $i=0;$i < $num_int; $i++) {
 	if ($jj==0) { $usable_data=1 } #NAK
 	  else { $usable_data=0; } # OK
     }
-    verb("Previous data array created: $n_rows rows");
-    # Put the new values in the array
-    if (defined($$resultf{$oid_perf_inoct[$i]}) && defined($$resultf{$oid_perf_outoct[$i]})) {
-        $prev_values[$n_rows]=[ $timenow, $$resultf{$oid_perf_inoct[$i]}, $$resultf{$oid_perf_outoct[$i]}, 0,0,0,0 ];
-        if (defined($o_ext_checkperf)) { # Add other values (error & disc)
-          $prev_values[$n_rows][3]=$$resultf{$oid_perf_inerr[$i]} if defined($$resultf{$oid_perf_inerr[$i]});
-          $prev_values[$n_rows][4]=$$resultf{$oid_perf_outerr[$i]} if defined($$resultf{$oid_perf_outerr[$i]});
-          $prev_values[$n_rows][5]=$$resultf{$oid_perf_indisc[$i]} if defined($$resultf{$oid_perf_indisc[$i]});
-          $prev_values[$n_rows][6]=$$resultf{$oid_perf_outdisc[$i]} if defined($$resultf{$oid_perf_outdisc[$i]});
+    if (defined($o_autocounters) && defined($o_prevperf) && !defined($o_filestore)) {
+        my $previous_bits = $prev_perf{perf_name($descr[$i], 'counter_bits')};
+        for my $row (@prev_values[0 .. $n_rows-1]) {
+            $row->[$n_items_check] = defined($previous_bits) ? $previous_bits : 0;
         }
-	$n_rows++;
     }
+    verb("Previous data array created: $n_rows rows");
+    # Keep only the contiguous valid history after the most recent reset.
+    # This also repairs existing history files without manual deletion.
+    my $rate_reason = 'waiting for rate samples';
+    my @current = ($timenow, $$resultf{$oid_perf_inoct[$i]}, $$resultf{$oid_perf_outoct[$i]});
+    if (defined($o_ext_checkperf)) {
+        push @current, map { $$resultf{$_} }
+            ($oid_perf_inerr[$i], $oid_perf_outerr[$i], $oid_perf_indisc[$i], $oid_perf_outdisc[$i]);
+    }
+    push @current, $bits if defined($o_autocounters);
+    my @clean;
+    for my $row (@prev_values[0 .. $n_rows-1], \@current) {
+        unless (valid_rate_sample($row, $n_items_check) && $row->[0] <= $timenow
+            && (!defined($o_autocounters) || ($bits && defined($row->[$n_items_check]) && $row->[$n_items_check] == $bits))) {
+            @clean = ();
+            $rate_reason = 'missing or invalid counters';
+            next;
+        }
+        if (@clean && !valid_rate_pair($clean[-1], $row, $bits == 64, $portspeed[$i], $n_items_check)) {
+            @clean = ();
+            $rate_reason = 'counter discontinuity or implausible rate; rebuilding baseline';
+        }
+        push @clean, $row;
+    }
+    @prev_values = @clean;
+    $n_rows = scalar(@prev_values);
+    $usable_data = $n_rows >= 2 ? 0 : 1;
     #make the checks if the file is OK
     if ($usable_data==0) {
       my $j;
@@ -1880,7 +2013,7 @@ for (my $i=0;$i < $num_int; $i++) {
       $checkval_tdiff=undef;
 
       # Calculate averages & metrics
-      $j=$n_rows-1;
+      $j=$n_rows-2;
       do {
 	if ($prev_values[$j][0] < $trigger) {
 	  if ($prev_values[$j][0] > $trigger_low) {
@@ -1916,19 +2049,19 @@ for (my $i=0;$i < $num_int; $i++) {
 	    }
 	    # check if the counter is back to 0 after 2^32 / 2^64.
 	    # First set the modulus depending on highperf counters or not
-	    my $overfl_mod = defined ($o_highperf) ? 18446744073709551616 : 4294967296;
+	    my $overfl_mod = $bits == 64 ? 18446744073709551616 : 4294967296;
 
 	    if (($checkval_tdiff=$prev_values[$j+1][0]-$prev_values[$j][0])!=0) {
               # check_perf_out_raw is array used to store calculations from multiple counts
-              $checkperf_out_raw[$jj] = [ 0,0,0,0,0 ];
+              $checkperf_out_raw[$jj] = [ 0,0,0,0,0,0 ];
 
 	      # Check counter (s)
-	      if ($prev_values[$j+1][1]!=0 && $prev_values[$j][1]!=0) {
+	      if (defined($prev_values[$j+1][1]) && defined($prev_values[$j][1])) {
 	        $overfl = ($prev_values[$j+1][1] >= $prev_values[$j][1] ) ? 0 : $overfl_mod;
 	        $checkval_in = ($overfl + $prev_values[$j+1][1] - $prev_values[$j][1]) / $checkval_tdiff ;
 	        $checkperf_out_raw[$jj][0] = $checkval_in / $speed_metric;
 	      }
-	      if ($prev_values[$j+1][2]!=0 && $prev_values[$j][2]!=0) {
+	      if (defined($prev_values[$j+1][2]) && defined($prev_values[$j][2])) {
 	    	$overfl = ($prev_values[$j+1][2] >= $prev_values[$j][2] ) ? 0 : $overfl_mod;
 	        $checkval_out = ($overfl + $prev_values[$j+1][2] - $prev_values[$j][2]) / $checkval_tdiff;
 	        $checkperf_out_raw[$jj][1] = $checkval_out / $speed_metric;
@@ -1939,7 +2072,7 @@ for (my $i=0;$i < $num_int; $i++) {
 	        $checkperf_out_raw[$jj][4] = ( ($prev_values[$j+1][5] - $prev_values[$j][5])/ $checkval_tdiff )*60;
 	        $checkperf_out_raw[$jj][5] = ( ($prev_values[$j+1][6] - $prev_values[$j][6])/ $checkval_tdiff )*60;
 	      }
-	      $jj++ if $checkperf_out_raw[$jj][0]!=0 || $checkperf_out_raw[$jj][1]!=0;
+	      $jj++; # A valid idle interval is a real zero-rate sample.
 	    }
 	  }
 	}
@@ -1948,10 +2081,10 @@ for (my $i=0;$i < $num_int; $i++) {
 
       # Calculate total as average
       if ($jj>0) {
-        for (my $k=0;$k<5;$k++) {
+        for (my $k=0;$k<(defined($o_ext_checkperf)?6:2);$k++) {
           $n=0;
           for ($j=0;$j<$jj;$j++) {
-	    if ($checkperf_out_raw[$j][$k]!=0) {
+	    if (defined($checkperf_out_raw[$j][$k])) {
 	      $n++;
 	      $checkperf_out[$k]+=$checkperf_out_raw[$j][$k];
             }
@@ -1967,7 +2100,7 @@ for (my $i=0;$i < $num_int; $i++) {
     }
     # WL: modified to not write the file if both -P and -T options are used
     if (defined($temp_file_name) && ($o_filestore || !$o_prevperf || !$o_prevtime)) {
-      if (($_=write_file($temp_file_name,$n_rows,$n_items_check,@prev_values))!=0) {
+      if (($_=write_file($temp_file_name,$n_rows,$n_items_check + (defined($o_autocounters) ? 1 : 0),@prev_values))!=0) {
         $final_status=3;
         $print_out.= " !!Unable to write file ".$temp_file_name." !! ";
         verb ("Write file returned : $_");
@@ -2002,9 +2135,8 @@ for (my $i=0;$i < $num_int; $i++) {
       $print_out .= ")";
     }
     else { # Return unknown when no data
-      $print_out.= " (no usable data - ".$n_rows." rows) ";
-      # WL: I've removed return of UNKNOWN if no data is available, when plugin is first used that may well happen
-      # $final_status=3;
+      $print_out.= " (rate unavailable: ".$rate_reason." - ".$n_rows." rows) ";
+      $final_status=3 if $final_status==0;
     }
   }
   else {
@@ -2076,8 +2208,8 @@ for (my $i=0;$i < $num_int; $i++) {
     }
     # output in octet counter
     if (defined($o_perfo) || defined($o_prevperf)) {
-        $perf_out .= " ".perf_name($descr[$i],"in_octet")."=". $$resultf{$oid_perf_inoct[$i]} ."c" if defined($oid_perf_inoct[$i]) && defined($$resultf{$oid_perf_inoct[$i]});
-        $perf_out .= " ".perf_name($descr[$i],"out_octet")."=". $$resultf{$oid_perf_outoct[$i]} ."c" if defined($oid_perf_outoct[$i]) && defined($$resultf{$oid_perf_outoct[$i]});
+        $perf_out .= " ".perf_name($descr[$i],"in_octet")."=". $$resultf{$oid_perf_inoct[$i]} ."c" if defined($oid_perf_inoct[$i]) && defined($$resultf{$oid_perf_inoct[$i]}) && $$resultf{$oid_perf_inoct[$i]} =~ /\A\d+\z/;
+        $perf_out .= " ".perf_name($descr[$i],"out_octet")."=". $$resultf{$oid_perf_outoct[$i]} ."c" if defined($oid_perf_outoct[$i]) && defined($$resultf{$oid_perf_outoct[$i]}) && $$resultf{$oid_perf_outoct[$i]} =~ /\A\d+\z/;
     }
     if (defined ($o_perfe)) {
         $perf_out .= " ".perf_name($descr[$i],"in_error")."=". $$resultf{$oid_perf_inerr[$i]} ."c" if defined $$resultf{$oid_perf_inerr[$i]};
@@ -2120,6 +2252,9 @@ if (defined($o_prevperf) && $o_pcount>0) {
   for (my $i=0; $i<$num_int; $i++) {
     $pcount=0;
     foreach $loop_time (reverse sort(@prev_time)) {
+        next if defined($o_autocounters) &&
+            (!defined($prev_perf{perf_name($descr[$i], 'counter_bits')}) ||
+             $prev_perf{perf_name($descr[$i], 'counter_bits')} != ($counter_bits[$i] || 0));
       if (defined($descr[$i]) && $pcount<($o_pcount-1)) {
         my $pnpref='.'.$loop_time;
         $pnpref='' if defined($prev_perf{ptime}) && $prev_perf{ptime} eq $loop_time;
@@ -2165,3 +2300,4 @@ else {
 print " | ",$perf_out if defined($perf_out);
 print "\n";
 exit $ERRORS{$exit_status};
+
