@@ -48,7 +48,7 @@ sub get_request {
 class NetintRateTests(unittest.TestCase):
     def run_check(self, rows, incoming, outgoing, *, high=True, speed=1000000000,
                   extended=False, discard=0, status=1, previous_perf=False, rate_output=True,
-                  auto=False, counters=None, minimized=False, previous_bits=None, multi=False):
+                  auto=False, counters=None, minimized=False, previous_bits=None, multi=False, automatic=False, snmp_port=161, unsafe_state=None, hostname="fixture.invalid"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'Net').mkdir()
@@ -62,7 +62,7 @@ class NetintRateTests(unittest.TestCase):
                    'DISCARD_OUT': str(discard), 'LINK_STATUS': str(status)}
             env.update({key: str(value) for key, value in (counters or {}).items()})
             env['MULTI'] = '1' if multi else ''
-            args = ['perl', '-w', str(PLUGIN), '-H', 'fixture.invalid', '-C', 'fixture',
+            args = ['perl', '-w', str(PLUGIN), '-H', hostname, '-C', 'fixture',
                     '-2', '-n', 'eth0', '-r', '-k', '-f', '--label', '-z']
             if rate_output:
                 args += ['-Y']
@@ -71,8 +71,22 @@ class NetintRateTests(unittest.TestCase):
                 args += ['-P', f"'eth0_in_octet'={cin}c 'eth0_out_octet'={cout}c ptime={stamp}", '-T', str(stamp)]
                 if previous_bits is not None:
                     args[-3] += f" 'eth0_counter_bits'={previous_bits}"
+            elif automatic:
+                args += ['--state-dir', str(root), '-p', str(snmp_port)]
             else:
                 args += ['-F', str(history)]
+            victim = root / 'victim'
+            if unsafe_state:
+                victim.write_text('do not overwrite\n')
+                if unsafe_state == 'lock':
+                    history.with_name('history.lock').symlink_to(victim)
+                elif unsafe_state == 'history':
+                    history.unlink()
+                    history.symlink_to(victim)
+                elif unsafe_state == 'directory':
+                    root.chmod(0o777)
+                    args += ['--state-dir', str(root)]
+                    pos=args.index('-F'); del args[pos:pos+2]
             if high:
                 args += ['-g']
             if extended:
@@ -89,6 +103,15 @@ class NetintRateTests(unittest.TestCase):
                     args.remove('-Y')
             result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=5)
             self.assertEqual(result.stderr, '', result.stderr)
+            if unsafe_state:
+                self.assertEqual(victim.read_text(), 'do not overwrite\n')
+            if automatic:
+                files=[p for p in root.glob('int.*') if not p.name.endswith('.lock')]
+                self.assertEqual(len(files),1)
+                self.assertRegex(files[0].name,r'^int\.[0-9a-f]{64}$')
+                self.last_history_name = files[0].name
+                self.assertEqual(files[0].stat().st_mode & 0o777,0o600)
+                return result, files[0].read_text()
             return result, history.read_text()
 
     def test_idle_zero_counters_are_valid(self):
@@ -218,7 +241,7 @@ class NetintRateTests(unittest.TestCase):
 
     def test_auto_width_switch_and_legacy_history_rebuild(self):
         for row in ([-600, 100, 100, 32], [-600, 100, 100]):
-            result, history = self.run_check([row], 614500, 614500, auto=True)
+            result, history = self.run_check([row], 614500, 614500, auto=True, counters={'IN32': 0, 'OUT32': 0})
             self.assertEqual(result.returncode, 3, result.stdout)
             self.assertEqual(len(history.splitlines()), 1)
             self.assertTrue(history.strip().endswith(':64'))
@@ -226,15 +249,52 @@ class NetintRateTests(unittest.TestCase):
     def test_auto_perfdata_history_requires_same_width(self):
         for previous_bits, expected in ((64, 0), (32, 3), (None, 3)):
             result, _ = self.run_check([[-600, 0, 0]], 0, 0, auto=True,
-                                       previous_perf=True, previous_bits=previous_bits)
+                                       previous_perf=True, previous_bits=previous_bits, counters={'IN32': 'noSuchObject', 'OUT32': 'noSuchObject'})
             self.assertEqual(result.returncode, expected, result.stdout)
 
     def test_auto_selects_different_widths_per_interface(self):
-        result, _ = self.run_check([], 0, 0, auto=True, multi=True)
+        result, _ = self.run_check([], 1, 2, auto=True, multi=True, counters={'IN32': 0, 'OUT32': 0})
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn('eth0:UP [counters=64-bit]', result.stdout)
         self.assertIn('eth1:UP [counters=32-bit]', result.stdout)
 
 
+
+    def test_mirrored_hc_uses_32_bit_and_survives_wrap(self):
+        # Both UNVRs expose HC octets identical to Counter32 octets.
+        for high in (True, False):
+            result, history = self.run_check([[-600, 4294967200, 4294967200, 32]],
+                                             614304, 614304, auto=True, high=high)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn('counters=32-bit', result.stdout)
+            self.assertIn('in=1.0KBps/out=1.0KBps', result.stdout)
+            self.assertEqual(len(history.splitlines()),2)
+
+    def test_true_hc_above_32_bit_limit_remains_64(self):
+        result, _ = self.run_check([[-600, 4294967200, 4294967200, 64]],
+                                   4295581600, 4295581600, auto=True,
+                                   counters={'IN32': 614304, 'OUT32': 614304})
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('counters=64-bit',result.stdout)
+
+    def test_automatic_private_history_without_F(self):
+        result, history = self.run_check([], 1, 2, automatic=True)
+        self.assertEqual(result.returncode,3,result.stdout)
+        self.assertEqual(len(history.splitlines()),1)
+
+    def test_state_symlinks_are_not_followed(self):
+        for attack in ('lock','history','directory'):
+            result,_=self.run_check([],1,2,unsafe_state=attack)
+            self.assertEqual(result.returncode,3,result.stdout)
+
+
+    def test_automatic_paths_separate_hosts_and_forwarded_ports(self):
+        names=[]
+        for hostname, port in (('192.168.7.140',1161),('192.168.7.140',1163),('192.168.7.141',1161),('../../untrusted host',1161)):
+            self.run_check([],1,2,automatic=True,snmp_port=port,hostname=hostname)
+            names.append(self.last_history_name)
+        self.assertEqual(len(set(names)),4)
+
 if __name__ == '__main__':
     unittest.main()
+
