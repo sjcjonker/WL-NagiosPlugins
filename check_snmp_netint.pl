@@ -95,10 +95,11 @@
 #   -w : warning levels
 #   -c : critical levels
 #
-#   If you specify '-k' a temporary file will be created in "/tmp" by default
+#   If you specify '-k' a temporary file will be created in "/var/spool/nagios/interfaces" by default
 #   (unless -P option is also used, see below). Directory and start of filename
 #   can be set with '-F' option with result file being like
 #     tmp_Nagios_int.<host IP>.<Interface name>, one file per interface
+#   An explicit -p/--port adds .<port> after the host; -F overrides the name.
 #
 #   If you do "-k -P \$SERVICEPERFDATA\$ -T \$LASTSERVICECHECK\$" then no file
 #   is created and instead data from previous check is feed back into plugin.
@@ -555,7 +556,7 @@ if ($@) {
 my $Version='2.36';
 
 ############### BASE DIRECTORY FOR TEMP FILE (override this with -F) ########
-my $o_base_dir="/tmp/tmp_Nagios_int.";
+my $o_base_dir="/var/spool/nagios/interfaces/tmp_Nagios_int.";
 my $file_history=200;   # number of data to keep in files.
 
 # SNMP OID Datas
@@ -662,6 +663,7 @@ my $o_stp=		undef;	# stp support option
 
 # Login and other options specific to SNMP
 my $o_port =		161;    # SNMP port
+my $o_port_explicit = 0;      # Include explicitly selected ports in history names
 my $o_octetlength=	undef;	# SNMP Message size parameter (Makina Corpus contrib)
 my $o_community =	undef; 	# community
 my $o_version2	=	undef;	# use snmp v2c
@@ -962,7 +964,8 @@ sub check_options {
    	'v:s'	=> \$o_verb,		'verbose:s' => \$o_verb, "debug:s" => \$o_verb,
         'h'     => \$o_help,    	'help'        	=> \$o_help,
         'H:s'   => \$o_host,		'hostname:s'	=> \$o_host,
-        'p:i'   => \$o_port,   		'port:i'	=> \$o_port,
+        'p:i' => sub { $o_port = $_[1]; $o_port_explicit = 1; },
+        'port:i' => sub { $o_port = $_[1]; $o_port_explicit = 1; },
 	'n:s'   => \$o_descr,           'name:s'        => \$o_descr,
         'C:s'   => \$o_community,	'community:s'	=> \$o_community,
 	 '2'	=> \$o_version2,	'v2c'		=> \$o_version2,
@@ -1806,7 +1809,9 @@ for (my $i=0;$i < $num_int; $i++) {
         else {
 	  $temp_file_name=$descr[$i];
 	  $temp_file_name =~ s/[ ;\/]/_/g;
-	  $temp_file_name = $o_base_dir . $o_host ."." . $temp_file_name;
+          # Forwarded devices can share a host address and interface name.
+          $temp_file_name = $o_base_dir . $o_host .
+              ($o_port_explicit ? "." . $o_port : "") . "." . $temp_file_name;
         }
         # First, read entire file
         my @ret_array=read_file($temp_file_name,$n_items_check);
