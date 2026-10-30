@@ -2000,6 +2000,10 @@ for (my $i=0;$i < $num_int; $i++) {
     @prev_values = @clean;
     $n_rows = scalar(@prev_values);
     $usable_data = $n_rows >= 2 ? 0 : 1;
+    if (defined($o_prct) && (!defined($portspeed[$i]) || $portspeed[$i] <= 0)) {
+        $usable_data = 1;
+        $rate_reason = 'cannot calculate percentage without positive interface speed';
+    }
     #make the checks if the file is OK
     if ($usable_data==0) {
       my $j;
@@ -2300,4 +2304,5 @@ else {
 print " | ",$perf_out if defined($perf_out);
 print "\n";
 exit $ERRORS{$exit_status};
+
 

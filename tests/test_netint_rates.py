@@ -48,7 +48,7 @@ sub get_request {
 class NetintRateTests(unittest.TestCase):
     def run_check(self, rows, incoming, outgoing, *, high=True, speed=1000000000,
                   extended=False, discard=0, status=1, previous_perf=False, rate_output=True,
-                  auto=False, counters=None, minimized=False, previous_bits=None, multi=False, automatic=False, snmp_port=161, unsafe_state=None, hostname="fixture.invalid"):
+                  auto=False, counters=None, minimized=False, previous_bits=None, multi=False, automatic=False, snmp_port=161, unsafe_state=None, hostname="fixture.invalid", percentage=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'Net').mkdir()
@@ -66,6 +66,8 @@ class NetintRateTests(unittest.TestCase):
                     '-2', '-n', 'eth0', '-r', '-k', '-f', '--label', '-z']
             if rate_output:
                 args += ['-Y']
+            if percentage:
+                args += ['-u']
             if previous_perf:
                 stamp, cin, cout = samples[-1]
                 args += ['-P', f"'eth0_in_octet'={cin}c 'eth0_out_octet'={cout}c ptime={stamp}", '-T', str(stamp)]
@@ -145,6 +147,18 @@ class NetintRateTests(unittest.TestCase):
     def test_unknown_speed_accepts_monotonic_counters(self):
         result, _ = self.run_check([[-600, 100, 200]], 614500, 614600, speed=0)
         self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_percentage_with_zero_speed_is_unknown(self):
+        result, _ = self.run_check([[-600, 100, 200]], 614500, 614600,
+                                   speed=0, percentage=True)
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn('positive interface speed', result.stdout)
+
+    def test_percentage_with_known_speed_preserves_rates(self):
+        result, _ = self.run_check([[-600, 100, 200]], 600100, 600200,
+                                   speed=800000, percentage=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('in=1.0%/out=1.0%', result.stdout)
 
     def test_missing_counters_do_not_reuse_history(self):
         result, history = self.run_check([[-1200, 100, 100], [-600, 200, 200]], 'noSuchInstance', 300)
@@ -297,4 +311,5 @@ class NetintRateTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 
